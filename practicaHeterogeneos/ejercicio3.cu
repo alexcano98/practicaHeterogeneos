@@ -1,0 +1,316 @@
+#include "cuda_runtime.h"
+
+#include "device_launch_parameters.h"
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/opencv.hpp>
+#include <stdio.h>
+
+using namespace cv;
+
+float* createFilter(int width)
+{
+    const float sigma = 2.f;                          // Standard deviation of the Gaussian distribution.
+
+    const int       half = width / 2;
+    float           sum = 0.f;
+
+
+    // Create convolution matrix
+    float* res = (float*)malloc(width * width * sizeof(float)); //int to long?
+
+
+    // Calculate filter sum first
+    for (int r = -half; r <= half; ++r)
+    {
+        for (int c = -half; c <= half; ++c)
+        {
+            // e (natural logarithm base) to the power x, where x is what's in the brackets
+            float weight = expf(-static_cast<float>(c * c + r * r) / (2.f * sigma * sigma));
+            int idx = (r + half) * width + c + half;
+
+            res[idx] = weight;
+            sum += weight;
+        }
+    }
+
+    // Normalize weight: sum of weights must equal 1
+    float normal = 1.f / sum;
+
+    for (int r = -half; r <= half; ++r)
+    {
+        for (int c = -half; c <= half; ++c)
+        {
+            int idx = (r + half) * width + c + half;
+
+            res[idx] *= normal;
+        }
+    }
+    return res;
+}
+
+
+__global__ void  ComputeConvolutionOnGPU(unsigned char* blurredChannel, const unsigned char* const inputChannel,
+    int *rows, int *cols, float* filter, int *filterWidth)
+{   
+    int c = blockIdx.x * blockDim.x + threadIdx.x; //colun
+    int r = blockIdx.y * blockDim.y + threadIdx.y; //row
+    
+
+    extern __shared__ float sh_filter[81];
+    int proyeccion = threadIdx.x + blockDim.x * threadIdx.y;
+    if (proyeccion < 81) {
+        sh_filter[proyeccion] = filter[proyeccion];
+    }
+
+    if ( (*rows) > r && (*cols) > c) {
+        //si esta dentro...
+
+        __syncthreads(); //barrera para esperar que el filtro este copiado.    
+
+        const int half = (*filterWidth) / 2;
+        const int width = (*cols) -1;
+        const int height = (*rows) -1;
+
+       float blur = 0.f;
+        // Average pixel color summing up adjacent pixels.
+       for (int i = -half; i <= half; ++i)
+        {
+            for (int j = -half; j <= half; ++j)
+            {
+                // Clamp filter to the image border
+                int h = min(max(r + i, 0), height);
+                int w = min(max(c + j, 0), width);
+
+                // Blur is a product of current pixel value and weight of that pixel.
+                // Remember that sum of all weights equals to 1, so we are averaging sum of all pixels by their weight.
+                int       idx = w + (*cols) * h;                           // current pixel index
+                float   pixel = static_cast<float>(inputChannel[idx]);
+
+                idx = (i + half) * (*filterWidth) + j + half;
+                float   weight = sh_filter[idx];
+
+                blur += pixel * weight;
+            }
+        }
+
+       blurredChannel[c + (*cols) * r] = static_cast<unsigned char>(blur); //'a'; inputChannel[c + cols * r];
+
+    }
+}
+
+void checkCudaErrors(cudaError_t cudaStatus) {
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cuda returned error code %d !\n", cudaStatus);
+        printf("Error status is %s\n", cudaGetErrorString(cudaStatus));
+        return;
+    }
+}
+
+void GaussianBlurOnGPU(uchar4* const modifiedImage, const uchar4* const rgba, int rows, int cols, float* filter, int  filterWidth)
+{
+
+    const int numPixels = rows * cols;
+    dim3 blockShape = dim3(16, 16);
+    int dim1 = (cols / blockShape.x) + 1;
+    int dim2 = (rows / blockShape.y) + 1;
+    dim3 gridShape = dim3( dim1 , dim2);
+
+
+    checkCudaErrors( cudaSetDeviceFlags(cudaDeviceMapHost) );
+
+
+    // Create channel variables
+    unsigned char* red; // = new unsigned char[numPixels];
+    checkCudaErrors(cudaHostAlloc(&red, numPixels, cudaHostAllocMapped)); //cudaMallocManaged ??
+
+    unsigned char* green; // = new unsigned char[numPixels];
+    checkCudaErrors(cudaHostAlloc(&green, numPixels, cudaHostAllocMapped));
+
+    unsigned char* blue; // = new unsigned char[numPixels];
+    checkCudaErrors(cudaHostAlloc(&blue, numPixels, cudaHostAllocMapped));
+   
+    
+    unsigned char* redBlurred; // = new unsigned char[numPixels];  //(float *) malloc(numPixels * sizeof(float));
+    checkCudaErrors(cudaHostAlloc(&redBlurred, numPixels, cudaHostAllocMapped));
+    unsigned char* greenBlurred; // = new unsigned char[numPixels];
+    checkCudaErrors(cudaHostAlloc(&greenBlurred, numPixels, cudaHostAllocMapped));
+    unsigned char* blueBlurred; // = new unsigned char[numPixels];
+    checkCudaErrors(cudaHostAlloc(&blueBlurred, numPixels, cudaHostAllocMapped));
+
+
+
+    // Separate RGBAimage into red, green, and blue components
+    for (int p = 0; p < numPixels; ++p)
+    {
+        uchar4 pixel = rgba[p];
+
+        red[p] = pixel.x;
+        green[p] = pixel.y;
+        blue[p] = pixel.z;
+    }
+    printf("paso");
+    //Init commom cuda variables
+
+    int *dev_rows,  *dev_cols,  *dev_filterWidth;
+    float* dev_filter;
+
+    // ¿La memoria unificada es coherente? ¿Vale la pena?
+
+    checkCudaErrors( cudaMalloc(&dev_rows, sizeof(int)) );
+    checkCudaErrors( cudaMalloc(&dev_cols, sizeof(int)) );
+    checkCudaErrors( cudaMalloc(&dev_filterWidth, sizeof(int)) );
+    checkCudaErrors( cudaMalloc(&dev_filter, (filterWidth) * (filterWidth) * sizeof(float)) );
+
+
+    checkCudaErrors( cudaMemcpy(dev_cols, &cols, sizeof(int), cudaMemcpyHostToDevice) );
+    checkCudaErrors( cudaMemcpy(dev_rows, &rows, sizeof(int), cudaMemcpyHostToDevice) );
+    checkCudaErrors( cudaMemcpy(dev_filterWidth, &filterWidth, sizeof(int), cudaMemcpyHostToDevice));
+    checkCudaErrors( cudaMemcpy(dev_filter, filter, (filterWidth) * (filterWidth) * sizeof(float), cudaMemcpyHostToDevice) );
+
+
+    //cudaStream_t* streams = (cudaStream_t*)malloc(3 * sizeof(cudaStream_t));
+   
+
+
+    // Compute convolution for each individual channel
+
+    //primera iter
+    unsigned char* dev_red;
+    unsigned char* dev_redBlurred;
+
+    
+    checkCudaErrors( cudaHostGetDevicePointer(&dev_redBlurred, redBlurred, 0));
+    checkCudaErrors( cudaHostGetDevicePointer(&dev_red, red, 0) );
+    ComputeConvolutionOnGPU <<<gridShape,blockShape>>>(dev_redBlurred, dev_red, dev_rows, dev_cols, dev_filter, dev_filterWidth);
+    
+    
+    //segunda iter
+    unsigned char* dev_green;
+    unsigned char* dev_greenBlurred;
+
+    checkCudaErrors(cudaHostGetDevicePointer(&dev_greenBlurred, greenBlurred, 0));
+    checkCudaErrors(cudaHostGetDevicePointer(&dev_green, green, 0));
+    ComputeConvolutionOnGPU << <gridShape, blockShape >> > (dev_greenBlurred , dev_green , dev_rows, dev_cols, dev_filter, dev_filterWidth);
+
+
+    //tercera iter
+    unsigned char* dev_blue; 
+    unsigned char* dev_blueBlurred;
+
+    checkCudaErrors(cudaHostGetDevicePointer(&dev_blueBlurred, blueBlurred, 0));
+    checkCudaErrors(cudaHostGetDevicePointer(&dev_blue, red, 0));
+    ComputeConvolutionOnGPU << <gridShape, blockShape>> > (dev_blueBlurred, dev_blue, dev_rows, dev_cols, dev_filter, dev_filterWidth);
+
+    checkCudaErrors(cudaDeviceSynchronize()); //fin
+
+    
+
+    // Recombine channels back into an RGBAimage setting alpha to 255, or fully opaque
+    for (int p = 0; p < numPixels; ++p) //numPixels
+    {
+        unsigned char r = redBlurred[p];
+        //printf("%c ", redBlurred[p]);
+        unsigned char g = greenBlurred[p];
+        unsigned char b = blueBlurred[p];
+
+        modifiedImage[p] = make_uchar4(r, g, b, 255);
+    }
+
+    
+    /*delete[] red;
+    delete[] green;
+    delete[] blue;
+    delete[] redBlurred;
+    delete[] greenBlurred;
+    delete[] blueBlurred;*/
+
+   
+    cudaFreeHost(red);
+    cudaFreeHost(green);
+    cudaFreeHost(blue);
+    cudaFreeHost(redBlurred);
+    cudaFreeHost(greenBlurred);
+    cudaFreeHost(blueBlurred);
+
+    cudaFree(dev_red);
+    cudaFree(dev_green);
+    cudaFree(dev_blue);
+    cudaFree(dev_redBlurred);
+    cudaFree(dev_greenBlurred);
+    cudaFree(dev_blueBlurred);
+}
+
+
+Mat getRandomImage() {
+
+    Mat img = Mat::ones(20000, 20000, CV_8UC3) *4;
+    return img;
+}
+
+
+// Main entry into the application
+int main(int argc, char** argv)
+{
+    char* imagePath;
+    char* outputPath;
+
+    int height, width, channels;
+    uchar4* originalImage, * blurredImage;
+
+    int filterWidth = 9;
+    float* filter = createFilter(filterWidth);
+
+    if (argc > 2)
+    {
+        imagePath = argv[1];
+        outputPath = argv[2];
+    }
+    else
+    {
+        printf("Please provide input and output image files as arguments to this application.");
+        exit(1);
+    }
+
+    //printf("imagen %s \n", imagePath);
+
+    Mat img;
+    Mat imgRGBA;
+  
+    //Read the image
+    img = imread(imagePath, IMREAD_COLOR); //problemas para muchos pixeles
+
+    if (img.empty()) printf("Could not load image file: %s\n", imagePath);
+    
+    //img = getRandomImage(); //lo pongo random por el tamaño
+
+    // get the image data
+    height = img.rows;
+    width = img.cols;
+    channels = img.channels();
+
+    cvtColor(img, imgRGBA, COLOR_BGR2BGRA);
+
+    //Allocate and copy
+    originalImage = (uchar4*) imgRGBA.ptr<unsigned char>(0);;
+    blurredImage = (uchar4*) malloc(width * height * sizeof(uchar4));
+
+    //Tu práctica empieza aquí
+    //CUDA	
+
+    GaussianBlurOnGPU(blurredImage, originalImage, height, width, filter, filterWidth);
+
+    //Version CPU (Comentar cuando se trabaje con la GPU!)
+   // GaussianBlurOnCPU(blurredImage, originalImage, height, width, filter, filterWidth);
+
+    Mat out(height, width, CV_8UC4, blurredImage);
+
+    imwrite(outputPath, out);
+
+    printf("Done!\n");
+    return 0;
+}
+
+
+
